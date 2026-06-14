@@ -25,6 +25,7 @@ show_usage() {
 
 选项:
   --split             将不同章节拆分成多个 Markdown 文件，放入 <输出名>-notion/ 目录
+                      不保留拆分用的中间 .md 和 media 目录
   --split-level N     指定拆分标题层级，范围 1-6，默认 2
   -h, --help          显示帮助信息
 
@@ -35,7 +36,7 @@ show_usage() {
 EOF
 }
 
-LUA_FILTER="" TITLE_MAP=""
+LUA_FILTER="" TITLE_MAP="" SPLIT_WORK_DIR=""
 # 临时文件只在本次转换中使用。脚本中间失败时也要清理，避免 /tmp 堆积旧 filter/map。
 cleanup() {
   if [ -n "$LUA_FILTER" ] && [ -f "$LUA_FILTER" ]; then
@@ -43,6 +44,9 @@ cleanup() {
   fi
   if [ -n "$TITLE_MAP" ] && [ -f "$TITLE_MAP" ]; then
     rm -f "$TITLE_MAP"
+  fi
+  if [ -n "$SPLIT_WORK_DIR" ] && [ -d "$SPLIT_WORK_DIR" ]; then
+    rm -rf "$SPLIT_WORK_DIR"
   fi
   return 0
 }
@@ -102,18 +106,26 @@ command -v perl &>/dev/null || die "需要安装 perl"
 
 BASENAME=$(basename "$INPUT" .epub)
 if [ "${#POSITIONAL[@]}" -ge 2 ]; then
-  OUTPUT="${POSITIONAL[1]}"
+  REQUESTED_OUTPUT="${POSITIONAL[1]}"
 else
-  OUTPUT="${BASENAME}.md"
+  REQUESTED_OUTPUT="${BASENAME}.md"
 fi
-OUTPUT_DIR=$(dirname "$OUTPUT")
-OUTPUT_NAME=$(basename "$OUTPUT" .md)
-MEDIA_DIR="${OUTPUT_DIR}/${OUTPUT_NAME}-media"
-MEDIA_BASENAME=$(basename "$MEDIA_DIR")
+OUTPUT_DIR=$(dirname "$REQUESTED_OUTPUT")
+OUTPUT_NAME=$(basename "$REQUESTED_OUTPUT" .md)
+OUTPUT="$REQUESTED_OUTPUT"
+MEDIA_BASENAME="${OUTPUT_NAME}-media"
+MEDIA_DIR="${OUTPUT_DIR}/${MEDIA_BASENAME}"
 SPLIT_DIR="${OUTPUT_DIR}/${OUTPUT_NAME}-notion"
 SPLIT_COUNT=0
 ZIP_OUTPUT=""
 [ -d "$OUTPUT_DIR" ] || mkdir -p "$OUTPUT_DIR"
+
+if [ "$SPLIT" -eq 1 ]; then
+  # 完整 Markdown 在 split 模式下只是拆分源；放进临时目录，避免输出目录留下重复产物。
+  SPLIT_WORK_DIR=$(mktemp -d /tmp/epub2md-split-XXXXXX)
+  OUTPUT="${SPLIT_WORK_DIR}/${OUTPUT_NAME}.md"
+  MEDIA_DIR="${SPLIT_WORK_DIR}/${MEDIA_BASENAME}"
+fi
 
 TOTAL_STEPS=6
 [ "$SPLIT" -eq 1 ] && TOTAL_STEPS=7
@@ -263,6 +275,7 @@ my @current_lines;
 my $current_title = "";
 my $page_index = 0;
 
+# 拆分逻辑有 TOC 模式和 fallback 模式两条路径；每条路径开始前都重置状态。
 sub reset_state {
   %used_names = ();
   @created_files = ();
@@ -273,6 +286,8 @@ sub reset_state {
 }
 
 sub normalize_title {
+  # 标题匹配需要容忍 pandoc 的不同输出形式：
+  # 同一个 EPUB 标题可能是 "# 标题"、"**标题**" 或链接文本。
   my ($title) = @_;
   $title =~ s/\r//g;
   $title =~ s/^\s+|\s+$//g;
@@ -286,6 +301,7 @@ sub normalize_title {
 }
 
 sub clean_title {
+  # 文件名使用标题文本，但必须避开 macOS/Windows 都不适合的路径字符。
   my ($title) = @_;
   $title = normalize_title($title);
   $title =~ s/[\/\\:*?"<>|]/_/g;
@@ -295,6 +311,7 @@ sub clean_title {
 }
 
 sub unique_path {
+  # 不同章节可能同名，追加 -2/-3 避免覆盖已有文件。
   my ($index, $title) = @_;
   my $base = sprintf("%02d-%s", $index, clean_title($title));
   my $name = "$base.md";
@@ -308,6 +325,7 @@ sub unique_path {
 }
 
 sub write_page {
+  # 所有拆分输出都走这里，统一做首尾空行裁剪和 UTF-8 写入。
   my ($title, $lines_ref, $fixed_index) = @_;
   my @page_lines = @$lines_ref;
   shift @page_lines while @page_lines && $page_lines[0] =~ /^\s*$/;
@@ -325,6 +343,10 @@ sub write_page {
 my $book_title = $fallback_title ne "" ? $fallback_title : "全文";
 my @toc_entries;
 if ($title_map ne "" && -s $title_map) {
+  # TITLE_MAP 格式由上游 TOC 解析生成：
+  #   book<TAB>0<TAB>书名<TAB>
+  #   nav<TAB>目录深度<TAB>章节标题<TAB>href
+  # --split-level 在 TOC 模式下表示保留到第几层 navPoint。
   open my $map, "<:encoding(UTF-8)", $title_map or die "无法读取 $title_map: $!";
   while (my $line = <$map>) {
     chomp $line;
@@ -345,6 +367,7 @@ if ($title_map ne "" && -s $title_map) {
 }
 
 sub find_next_toc_match {
+  # 只向后匹配 TOC，避免正文中再次出现同名标题时被误识别为新章节。
   my ($key, $start_index, $entries_ref) = @_;
   for (my $i = $start_index; $i < @$entries_ref; $i++) {
     return $i if $entries_ref->[$i]->{key} eq $key;
@@ -353,6 +376,8 @@ sub find_next_toc_match {
 }
 
 sub split_by_toc {
+  # TOC 模式只认已经恢复成 Markdown 标题的 TOC 标题。
+  # 如果一个标题都匹配不到，返回 0 交给 fallback，避免输出单个错误文件。
   return 0 if !@toc_entries;
 
   reset_state();
@@ -392,6 +417,8 @@ sub split_by_toc {
 }
 
 sub flush_front_fallback {
+  # fallback 仍保留旧行为：第一章前的内容叫“前置内容”，末尾残留叫“后置内容”。
+  # 这只在没有可用 EPUB TOC 时生效。
   return if !@front_lines;
   my $title = @created_files ? "后置内容" : "前置内容";
   my $index = @created_files ? undef : 0;
@@ -407,16 +434,19 @@ sub flush_current {
 }
 
 sub is_chapter_like {
+  # 仅供无 TOC fallback 使用，TOC 模式绝不依赖这些正则判断章节。
   my ($title) = @_;
   return $title =~ /^(?:第[[:alnum:]一二三四五六七八九十百千万零〇两]+[章节回](?:\s|$)|Chapter\s+[[:alnum:]]+(?:\s|$))/i;
 }
 
 sub is_part_like {
+  # 仅供无 TOC fallback 使用，用来识别篇/卷/Part 这类高层级标题。
   my ($title) = @_;
   return $title =~ /^(?:上篇|下篇|前篇|后篇|第.+?[部篇卷](?:\s|$)|Part\s+[[:alnum:]]+(?:\s|$))/i;
 }
 
 sub split_by_heading_fallback {
+  # fallback 尽量沿用原先拆分语义：先等到章/篇类标题出现，再按指定标题层级继续拆。
   reset_state();
   my $chapter_seen = 0;
 
@@ -468,6 +498,8 @@ PERLEOF
 TITLE_MAP=$(mktemp /tmp/epub-titles-XXXXXX.tsv)
 TOC_XML=$(find_toc_content "$INPUT" || true)
 if [ -n "$TOC_XML" ]; then
+  # 将 ncx XML 转成脚本内部更容易消费的 TSV。
+  # 这里不用“第X章”猜层级，而是保留 navPoint 的真实嵌套 depth。
   TOC_XML_ENV="$TOC_XML" perl -MEncode=decode,FB_CROAK -e '
     use strict;
     use warnings;
@@ -475,6 +507,7 @@ if [ -n "$TOC_XML" ]; then
     binmode STDOUT, ":encoding(UTF-8)";
 
     sub decode_xml_text {
+      # ncx 中的标题可能包含 XML entity 或 CDATA；写入 TSV 前统一转成纯文本。
       my ($text) = @_;
       $text =~ s/<!\[CDATA\[(.*?)\]\]>/$1/sg;
       $text =~ s/<[^>]+>//g;
@@ -494,6 +527,7 @@ if [ -n "$TOC_XML" ]; then
 
     my $xml = decode("UTF-8", $ENV{TOC_XML_ENV}, FB_CROAK);
     if ($xml =~ m{<docTitle\b[^>]*>.*?<text\b[^>]*>(.*?)</text>.*?</docTitle>}is) {
+      # docTitle 是书名，不是章节；拆分时只用它命名第一条 TOC 前的封面/标题页内容。
       my $book_title = decode_xml_text($1);
       print "book\t0\t$book_title\t\n" if $book_title ne "";
     }
@@ -501,6 +535,8 @@ if [ -n "$TOC_XML" ]; then
     my $depth = 0;
     my @stack;
     sub emit_nav {
+      # 有些 ncx 会把 <content> 放在 navLabel 后面，另一些则只在 navPoint 结束前补齐。
+      # 用 emitted 标记确保每个 navPoint 只输出一次。
       my ($entry) = @_;
       return if !$entry || $entry->{emitted} || !defined $entry->{title} || $entry->{title} eq "";
       my $href = defined $entry->{href} ? $entry->{href} : "";
@@ -510,6 +546,8 @@ if [ -n "$TOC_XML" ]; then
     }
 
     while ($xml =~ m{(<navPoint\b[^>]*>|</navPoint>|<text\b[^>]*>.*?</text>|<content\b[^>]*>)}gis) {
+      # 这个轻量 tokenizer 只关注 navPoint/text/content 三类节点，
+      # 足够处理 calibre 和多数 EPUB2 ncx，同时避免引入额外 XML 解析依赖。
       my $token = $1;
       if ($token =~ /^<navPoint\b/i) {
         $depth++;
@@ -544,6 +582,8 @@ pandoc "$INPUT" -f epub -t gfm+pipe_tables \
   --wrap=none --markdown-headings=atx -o "$OUTPUT"
 
 log "${GREEN}[4/${TOTAL_STEPS}]${NC} 清理残留 HTML（跳过代码块）..."
+# 这一步只做“不会改变 Markdown 结构”的行级清理，并跳过 fenced code block。
+# 段落之间的空行统一交给第 6 步处理，避免这里误删段落边界。
 perl -i -pe '
   if (/^(?:```|~~~)/) { $in_code = !$in_code }
   if (!$in_code) {
@@ -573,9 +613,13 @@ perl -i -0777 -pe '
 ' "$OUTPUT"
 
 if [ -s "$TITLE_MAP" ]; then
+  # pandoc 经常把 EPUB 里的标题输出成普通粗体行，甚至把“第一章 关于问题”
+  # 拆成两行“**第一章**”“**关于问题**”。这里按 TOC 标题做整文件扫描，
+  # 必要时合并相邻两行再恢复为 ATX 标题。
   TITLE_MAP_PATH="$TITLE_MAP" perl -i -0pe '
     BEGIN{
       sub normalize_title {
+        # 这里按字节处理 -i 输入，因此 NBSP 使用 UTF-8 字节序列 \xC2\xA0。
         my ($title) = @_;
         $title =~ s/\r//g;
         $title =~ s/^\s+|\s+$//g;
@@ -589,6 +633,7 @@ if [ -s "$TITLE_MAP" ]; then
       }
       open my $f,"<",$ENV{TITLE_MAP_PATH} or die;
       {
+        # 当前 perl 使用 -0 读取整个 Markdown；读取 TSV 时必须临时恢复换行分隔。
         local $/ = "\n";
         while(my $map_line=<$f>){chomp $map_line;my($kind,$depth,$title)=split/\t/,$map_line,4;next unless defined $title && $title ne "";
           next unless $kind eq "nav" && defined $depth && $depth =~ /^\d+$/;
@@ -632,6 +677,10 @@ if [ -s "$TITLE_MAP" ]; then
 fi
 
 log "${GREEN}[6/${TOTAL_STEPS}]${NC} 最终清理..."
+# 最终清理负责 Markdown 结构级规范化：
+# - 给标题、图片、普通段落等块级内容之间补一个空行。
+# - 连续列表项、表格行、引用行保持在同一块内，不额外打散。
+# - fenced code block 内部完全保留，避免破坏示例代码。
 perl -i -0pe '
   sub is_blank_line {
     my ($line) = @_;
@@ -650,6 +699,7 @@ perl -i -0pe '
   }
   sub is_quote_line { return $_[0] =~ /^\s{0,3}>\s?/; }
   sub block_type {
+    # 将非空行归类为 Markdown 块类型，后续根据相邻块类型决定是否插入空行。
     my ($line) = @_;
     return "heading" if is_heading_line($line);
     return "image" if is_image_line($line);
@@ -661,6 +711,7 @@ perl -i -0pe '
     return "para";
   }
   sub needs_block_gap {
+    # 大多数块之间需要一个空行；列表/表格/引用的连续行例外。
     my ($prev, $curr) = @_;
     return 0 if !$prev || !$curr;
     return 0 if ($prev eq "list" || $prev eq "child") && ($curr eq "list" || $curr eq "child");
@@ -677,6 +728,7 @@ perl -i -0pe '
 
   for my $line (@lines) {
     if ($in_code) {
+      # 代码块中不做任何空行归一化，只识别结束 fence。
       push @out, $line;
       if (is_fence_line($line)) {
         $in_code = 0;
@@ -709,6 +761,7 @@ normalize_media_links "$OUTPUT" "$MEDIA_BASENAME"
 
 if [ "$SPLIT" -eq 1 ]; then
   log "${GREEN}[7/${TOTAL_STEPS}]${NC} 拆分章节 Markdown..."
+  # split 输出目录每次重建，避免上一次转换遗留的旧章节或旧图片混入 Notion zip。
   rm -rf "$SPLIT_DIR"
   mkdir -p "$SPLIT_DIR"
   if [ -d "$MEDIA_DIR" ]; then
@@ -733,11 +786,13 @@ HTML_N=$(perl -ne '
 
 # 生成 Notion 导入 zip 包（markdown + 图片一起打包）
 if [ "$SPLIT" -eq 1 ] && command -v zip &>/dev/null && [ -d "$SPLIT_DIR" ]; then
+  # split 模式下 zip 根目录直接放多个 Markdown 和 media 目录，Notion 导入更稳定。
   ZIP_OUTPUT="${OUTPUT_DIR}/${OUTPUT_NAME}-notion.zip"
   rm -f "$ZIP_OUTPUT"
   (cd "$SPLIT_DIR" && zip -qr "../$(basename "$ZIP_OUTPUT")" .)
   log "  Notion 导入包: $ZIP_OUTPUT"
 elif command -v zip &>/dev/null && [ -d "$MEDIA_DIR" ] && [ "$IMGS" -gt 0 ]; then
+  # 单文件模式保留一个 Markdown + media 目录的结构。
   ZIP_OUTPUT="${OUTPUT_DIR}/${OUTPUT_NAME}-notion.zip"
   rm -f "$ZIP_OUTPUT"
   (cd "$OUTPUT_DIR" && zip -qr "$(basename "$ZIP_OUTPUT")" \
@@ -747,9 +802,13 @@ fi
 
 echo ""
 log "${GREEN}转换完成!${NC}"
-log "  输出: $OUTPUT ($LINES 行)"
-[ "$SPLIT" -eq 1 ] && log "  章节: $SPLIT_DIR/ ($SPLIT_COUNT 个 Markdown)"
-log "  图片: $MEDIA_DIR/ ($IMGS 张)"
+if [ "$SPLIT" -eq 1 ]; then
+  log "  章节: $SPLIT_DIR/ ($SPLIT_COUNT 个 Markdown)"
+  log "  图片: $SPLIT_DIR/$MEDIA_BASENAME/ ($IMGS 张)"
+else
+  log "  输出: $OUTPUT ($LINES 行)"
+  log "  图片: $MEDIA_DIR/ ($IMGS 张)"
+fi
 [ "$HTML_N" -gt 0 ] && log "${YELLOW}  警告: 残留 $HTML_N 处 HTML 标签${NC}"
 echo ""
 if [ -n "$ZIP_OUTPUT" ] && [ -f "$ZIP_OUTPUT" ]; then
